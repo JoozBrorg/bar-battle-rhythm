@@ -332,7 +332,7 @@ local function UpdateRhythm()
         buildingBigPower and (eNet < 0) and (ePct < 0.45) and (not energyStall)
 
     --------------------------------------------------------------------------
-    -- Eco gates (your request)
+    -- Eco gates
     -- ecoComfort: allow low-queue reminders (gentle)
     -- ecoDominant: push aggressive pressure (hard coaching)
     --------------------------------------------------------------------------
@@ -613,3 +613,4 @@ function widget:GameFrame(f)
         ClearTodos()
     end
 end
+
