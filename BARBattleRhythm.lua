@@ -66,6 +66,9 @@ local constructorCount = 0
 local constructionTurretCount = 0
 local buildPowerCount = 0
 
+-- NEW: how many builders are actively building right now (excludes commander)
+local activeAssistCount = 0
+
 -- converters detected by stats
 local converterCount = 0
 local t1ConverterCount = 0
@@ -101,7 +104,7 @@ local anyFactoryBuilding = false
 local factoryIdleSince = {}    -- [unitID] = time when became idle
 local idleFactoryCount = 0
 
--- sustained metal crash detection (fixes “false crash” when bank is huge)
+-- sustained metal crash detection
 local mCrashTicks = 0
 
 --------------------------------------------------------------------------------
@@ -144,12 +147,17 @@ local function IsTech3(ud)
     return t == "3" or t == 3
 end
 
+local function IsCommander(ud)
+    if not ud or not ud.customParams then return false end
+    local v = ud.customParams.iscommander
+    return v == "1" or v == "true" or v == true
+end
+
 local function IsWind(ud)
     if ud.windGenerator and ud.windGenerator > 0 then return true end
     return ud.name and ud.name:lower():find("wind")
 end
 
--- Keep AFUS name check (usually consistent), but we also count AFUS via high energy output below.
 local function IsAFUSName(ud)
     return ud.name and ud.name:lower():find("afus")
 end
@@ -162,7 +170,6 @@ local function IsUnitComplete(uid)
     return buildProgress >= 0.999
 end
 
--- Radar building ONLY
 local function IsRadarUnit(ud)
     if not ud then return false end
     if (ud.radarRadius and ud.radarRadius > 0) then return true end
@@ -175,7 +182,6 @@ local function IsRadarUnit(ud)
     return false
 end
 
--- Converter detection by actual conversion stats (energy upkeep -> metal make)
 local function IsConverterBuilding(ud)
     if not ud or not ud.isBuilding then return false end
     local em = ud.energyUpkeep or 0
@@ -191,14 +197,13 @@ end
 
 local function PhaseTimingColor(phaseKey, gameTimeSec)
     local targets = {
-        opening  = 90,   -- 1:30
-        t1Bridge = 210,  -- 3:30
-        tech     = 300,  -- 5:00
-        t2       = 480,  -- 8:00
-        t3       = 660,  -- 11:00
+        opening  = 90,
+        t1Bridge = 210,
+        tech     = 300,
+        t2       = 480,
+        t3       = 660,
         endgame  = nil,
     }
-
     local tEnd = targets[phaseKey]
     if not tEnd then return {0.9,0.9,0.9,1} end
 
@@ -215,7 +220,7 @@ end
 
 local function UpdateEconomy(projectActive)
     local alpha = EMA_ALPHA_BASE
-    if projectActive then alpha = 0.40 end -- faster response during big spends
+    if projectActive then alpha = 0.40 end
 
     eCur,eMax,eInc,eExp = Spring.GetTeamResources(myTeamID,"energy")
     mCur,mMax,mInc,mExp = Spring.GetTeamResources(myTeamID,"metal")
@@ -252,6 +257,8 @@ end
 
 local function UpdateUnits()
     windCount,constructorCount,constructionTurretCount = 0,0,0
+    activeAssistCount = 0
+
     converterCount,t1ConverterCount,t2ConverterCount,t3ConverterCount = 0,0,0,0
     mexCount,mexUpgradedCount,t2BuilderCount = 0,0,0
     radarCount,reactorCount,afusCount = 0,0,0
@@ -322,6 +329,14 @@ local function UpdateUnits()
                 if IsTech2(ud) then
                     t2BuilderCount = t2BuilderCount + 1
                 end
+
+                -- NEW: count only builders actively building/assisting (exclude commander)
+                if complete and (not ud.isBuilding) and (not IsCommander(ud)) then
+                    local tgt = Spring.GetUnitIsBuilding(uid)
+                    if tgt then
+                        activeAssistCount = activeAssistCount + 1
+                    end
+                end
             end
 
             -- Wind
@@ -347,23 +362,18 @@ local function UpdateUnits()
                 else t3ConverterCount = t3ConverterCount + 1 end
             end
 
-            -- POWER SPINE DETECTION (FIX)
-            -- Instead of name matching (armfus/corfus/etc), detect by net energy production.
-            -- Fusion reactors and AFUS will always produce huge sustained energy.
+            -- POWER SPINE DETECTION
             if complete and ud.isBuilding then
                 local eProd = (ud.energyMake or 0) - (ud.energyUpkeep or 0)
-
-                -- Fusion-class spine
                 if eProd >= 250 then
                     reactorCount = reactorCount + 1
-                    -- AFUS-class (very high output)
                     if eProd >= 650 or IsAFUSName(ud) then
                         afusCount = afusCount + 1
                     end
                 end
             end
 
-            -- Project flags: any large metal-cost building being built
+            -- Project flags
             if beingBuilt and ud.isBuilding then
                 local cost = ud.metalCost or 0
                 if cost >= 600 then
@@ -371,7 +381,6 @@ local function UpdateUnits()
                 end
             end
 
-            -- Tech/build “project” (if fusion/AFUS itself is being built, it’s a project)
             if beingBuilt and ud.isBuilding then
                 local eProd = (ud.energyMake or 0) - (ud.energyUpkeep or 0)
                 if eProd >= 250 then
@@ -420,7 +429,7 @@ local function UpdatePhase(t)
 end
 
 --------------------------------------------------------------------------------
--- RHYTHM ARROWS (smoothed + intent-aware)
+-- RHYTHM ARROWS
 --------------------------------------------------------------------------------
 
 local function ArrowFrom(netEMA, pct, intentSpend)
@@ -475,7 +484,7 @@ local function UpdateRhythm(projectActive)
 end
 
 --------------------------------------------------------------------------------
--- HYBRID BUFFER MODEL (percent OR absolute) + READINESS + WHY
+-- READINESS (unchanged from last version) + GUIDANCE (patched spike warning)
 --------------------------------------------------------------------------------
 
 local function ReadinessLabelAndColor(score)
@@ -488,14 +497,11 @@ local function WhyFromContrib(contrib, penaltyText, tag)
     if penaltyText and penaltyText ~= "" then
         return "Why: " .. penaltyText
     end
-
     local lowestKey = "eBuf"
     local lowestVal = contrib.eBuf
-
     local function chk(k, v)
         if v < lowestVal then lowestVal = v; lowestKey = k end
     end
-
     chk("mBuf", contrib.mBuf)
     chk("eTrend", contrib.eTrend)
     chk("mTrend", contrib.mTrend)
@@ -511,29 +517,20 @@ local function WhyFromContrib(contrib, penaltyText, tag)
     end
 end
 
--- Converts percent+raw into a 0..1 buffer score, and returns a helpful tag string
 local function HybridBufScore(pct, cur, pctFloor, pctSpan, rawFloor, rawSpan)
     local pScore = clamp((pct - pctFloor) / pctSpan, 0, 1)
     local rScore = clamp((cur - rawFloor) / rawSpan, 0, 1)
     local score = (pScore > rScore) and pScore or rScore
 
-    local tag
     local pctTxt = ("%d%%"):format(math.floor(pct*100 + 0.5))
     local rawTxt = ("%d"):format(math.floor(cur + 0.5))
-
-    if rScore > pScore then
-        tag = ("raw %s (storage high)"):format(rawTxt)
-    else
-        tag = ("pct %s"):format(pctTxt)
-    end
-
+    local tag = (rScore > pScore) and ("raw " .. rawTxt .. " (storage high)") or ("pct " .. pctTxt)
     return score, tag
 end
 
--- Metal-aware weights (T2): Ebuf 0.30 / Mbuf 0.30 / Etrend 0.20 / Mtrend 0.20
 local function ReadinessForT2(projectActive)
-    local eBuf, eTag = HybridBufScore(ePct, eCur, 0.20, 0.50, 4000, 8000) -- 4k..12k
-    local mBuf, mTag = HybridBufScore(mPct, mCur, 0.15, 0.55, 200, 450)   -- 200..650
+    local eBuf, eTag = HybridBufScore(ePct, eCur, 0.20, 0.50, 4000, 8000)
+    local mBuf, mTag = HybridBufScore(mPct, mCur, 0.15, 0.55, 200, 450)
 
     local eTrend = clamp((eNetEMA + 8) / 16, 0, 1)
     local mTrend = clamp((mNetEMA + 4) / 10, 0, 1)
@@ -544,19 +541,7 @@ local function ReadinessForT2(projectActive)
 
     if projectActive then
         penalty = penalty + 8
-        if penaltyText == "" then penaltyText = "Project in progress — protect buffers" end
-    end
-
-    if buildPowerCount >= 6 and ((ePct < 0.35 and eCur < 6000) or eNetEMA < -2) then
-        penalty = penalty + 15
-        penaltyText = ("Buildpower spike risk (%d builders)"):format(buildPowerCount)
-    end
-
-    -- IMPORTANT: no “metal crash” penalty here unless buffer is genuinely low
-    local lowMetalBuffer = (mPct < 0.15 and mCur < 600) or (mCur < 300)
-    if projectActive and lowMetalBuffer and mNetRaw < -6 then
-        penalty = penalty + 12
-        penaltyText = "Metal buffer low during project"
+        penaltyText = "Project in progress — protect buffers"
     end
 
     local score = 100 * (0.30*eBuf + 0.30*mBuf + 0.20*eTrend + 0.20*mTrend) - penalty
@@ -564,13 +549,12 @@ local function ReadinessForT2(projectActive)
 
     local label, col = ReadinessLabelAndColor(score)
     local why = WhyFromContrib({eBuf=eBuf, mBuf=mBuf, eTrend=eTrend, mTrend=mTrend}, penaltyText, whyTag)
-
     return math.floor(score + 0.5), label, col, why
 end
 
 local function ReadinessForT3(projectActive)
-    local eBuf, eTag = HybridBufScore(ePct, eCur, 0.25, 0.55, 8000, 14000) -- 8k..22k
-    local mBuf, mTag = HybridBufScore(mPct, mCur, 0.20, 0.60, 450, 900)    -- 450..1350
+    local eBuf, eTag = HybridBufScore(ePct, eCur, 0.25, 0.55, 8000, 14000)
+    local mBuf, mTag = HybridBufScore(mPct, mCur, 0.20, 0.60, 450, 900)
 
     local eTrend = clamp((eNetEMA + 10) / 20, 0, 1)
     local mTrend = clamp((mNetEMA + 5) / 12, 0, 1)
@@ -584,7 +568,7 @@ local function ReadinessForT3(projectActive)
 
     if projectActive then
         penalty = penalty + 6
-        if penaltyText == "" then penaltyText = "Project in progress — avoid over-commit" end
+        penaltyText = "Project in progress — avoid over-commit"
     end
 
     if energyRich and metalPressure and t2ConverterCount < 4 then
@@ -602,19 +586,13 @@ local function ReadinessForT3(projectActive)
     local spine = (reactorCount > 0 or afusCount > 0) and 1 or 0
     local spineBonus = spine * 6
 
-    -- Slightly more metal-weighted: Ebuf 0.28 / Mbuf 0.34 / Etrend 0.18 / Mtrend 0.20
     local score = 100 * (0.28*eBuf + 0.34*mBuf + 0.18*eTrend + 0.20*mTrend) + spineBonus - penalty
     score = clamp(score, 0, 100)
 
     local label, col = ReadinessLabelAndColor(score)
     local why = WhyFromContrib({eBuf=eBuf, mBuf=mBuf, eTrend=eTrend, mTrend=mTrend}, penaltyText, whyTag)
-
     return math.floor(score + 0.5), label, col, why
 end
-
---------------------------------------------------------------------------------
--- LENS (Boom / Pressure / Balanced)
---------------------------------------------------------------------------------
 
 local function UpdateLens()
     local boom = (mexCount >= 6) and (buildPowerCount >= 4) and (idleFactoryCount == 0)
@@ -632,10 +610,6 @@ local function UpdateLens()
     end
 end
 
---------------------------------------------------------------------------------
--- GUIDANCE (Milestones + Todo + Prep fallback + slider/storage + idle + buildpower)
---------------------------------------------------------------------------------
-
 local function UpdateGuidance(projectActive)
     Clear(milestones)
     Clear(todo)
@@ -646,7 +620,6 @@ local function UpdateGuidance(projectActive)
 
     local function done(cond) return cond and "done" or nil end
 
-    -- Phase-scoped buildpower milestones (ranges, eco-gated)
     local function AddBuildpowerMilestones()
         if currentPhaseKey == "opening" then
             Add(milestones, "Buildpower: 2+ builders", nil, done(buildPowerCount >= 2))
@@ -659,7 +632,6 @@ local function UpdateGuidance(projectActive)
         end
     end
 
-    -- Milestones (phase-scoped)
     if currentPhaseKey == "opening" then
         Add(milestones,"Get first factory online (Bot Lab)",nil,done(hasT1Factory))
         Add(milestones,"Secure 2–4 mex",nil,done(mexCount >= 2))
@@ -699,17 +671,14 @@ local function UpdateGuidance(projectActive)
         return true
     end
 
-    -- If T2 Spike milestones are all done, show “ready” tone (without changing phase)
     if currentPhaseKey == "t2" and AllMilestonesDone() then
         phaseLabel = "T2 Spike — READY for Eco Spine (Fusion/AFUS) / T3 Prep"
     end
 
-    -- Todo = ASAP (max 6)
     local function AddASAP(text, color)
         if #todo < 6 then Add(todo, text, color) end
     end
 
-    local energySafe    = (ePct > 0.30 or eCur > 4500) and (eNetEMA >= -1)
     local energyDipping = (eNetEMA < -6) or (ePct < 0.18 and eCur < 2500)
     local energyCrash   = (ePct < 0.10 and eCur < 1200) and (eNetEMA < -10)
 
@@ -719,221 +688,95 @@ local function UpdateGuidance(projectActive)
     local energyRich    = (ePct > 0.60) or (eNetEMA > 6) or (eCur > 9000)
     local energyWasted  = (ePct > 0.90) and (eNetEMA > 4)
 
-    -- Readiness lines (with “Why”)
+    -- Readiness lines
     readinessText, readinessWhyText = "", ""
 
     if currentPhaseKey == "t1Bridge" or currentPhaseKey == "tech" then
         local score, label, col, why = ReadinessForT2(projectActive)
-        if projectActive then
-            readinessText = ("T2 Build: IN PROGRESS — %d (%s)"):format(score, label)
-        else
-            readinessText = ("T2 Readiness: %d — %s"):format(score, label)
-        end
+        readinessText = projectActive
+            and ("T2 Build: IN PROGRESS — %d (%s)"):format(score, label)
+            or  ("T2 Readiness: %d — %s"):format(score, label)
         readinessWhyText = why
         readinessColor = col
-        readinessWhyColor = {0.8, 0.85, 1, 1}
     elseif currentPhaseKey == "t2" or currentPhaseKey == "t3" then
         local score, label, col, why = ReadinessForT3(projectActive)
-        if projectActive and (anyFactoryBuilding or bigSpendBuilding) then
-            readinessText = ("T3 Prep: PROJECT ACTIVE — %d (%s)"):format(score, label)
-        else
-            readinessText = ("T3 Readiness: %d — %s"):format(score, label)
-        end
+        readinessText = (projectActive and (anyFactoryBuilding or bigSpendBuilding))
+            and ("T3 Prep: PROJECT ACTIVE — %d (%s)"):format(score, label)
+            or  ("T3 Readiness: %d — %s"):format(score, label)
         readinessWhyText = why
         readinessColor = col
-        readinessWhyColor = {0.8, 0.85, 1, 1}
     end
 
-    -- Emergency (energy)
     if energyCrash then
         AddASAP("Emergency: Energy crashing — stop stacking builds", "block")
         AddASAP("Blocked by: Energy crash (finish power / wind first)", "block")
         return
     end
 
-    -- Sustained metal crash detection (FIX)
-    -- Only warn if:
-    --  - projectActive, AND
-    --  - sustained sharp negative raw metal, AND
-    --  - buffer is genuinely low (NOT “5k metal but storage huge”)
-    local lowMetalBuffer = (mPct < 0.15 and mCur < 600) or (mCur < 300)
-    if projectActive and (mNetRaw < -6) then
-        mCrashTicks = math.min(mCrashTicks + 1, 10)
-    else
-        mCrashTicks = 0
-    end
-
-    if projectActive and lowMetalBuffer and (mCrashTicks >= 2) then
-        AddASAP("CRITICAL: Metal buffer low during project — stop assisting", "block")
-        if energyRich then
-            AddASAP("Fix: scale converters / slider to hold Metal", "warn")
-        else
-            AddASAP("Fix: pause queues + stabilise (bank Metal)", "warn")
-        end
-    end
-
-    -- Eco comfort gate
     local ecoComfort = (ePct > 0.25 or eCur > 3000) and (mPct > 0.20 or mCur > 160) and (eNetEMA > -8)
 
-    -- Idle factories (only if eco is comfortable)
-    if ecoComfort and idleFactoryCount > 0 then
-        AddASAP(("Idle factory detected (%d) → queue units"):format(idleFactoryCount), "warn")
+    -- FIXED: spike warning uses ACTIVE assists (not total builders)
+    local spikeAssist = activeAssistCount + constructionTurretCount
+    if spikeAssist >= 4 and energyDipping and not energyRich then
+        AddASAP(("Buildpower spike risk → %d assisting (pause assists)"):format(spikeAssist), "warn")
     end
 
-    -- Slider / conversion / storage guidance (smart preference)
+    -- Overflow guidance (kept simple)
     if energyWasted then
-        if (metalPressure or projectActive or currentPhaseKey == "tech" or currentPhaseKey == "t3") then
+        if (metalPressure or projectActive) then
             if converterCount <= 0 then
                 AddASAP("Energy overflowing + metal pressure → build converters", "good")
             else
                 AddASAP("Energy overflowing → adjust conversion slider → more Metal", "good")
-                if (currentPhaseKey == "t2" or currentPhaseKey == "t3" or currentPhaseKey == "endgame") and t2ConverterCount < 4 then
-                    AddASAP("Scale T2 converters (avoid metal choke)", "warn")
-                elseif (currentPhaseKey == "t1Bridge") and t1ConverterCount < 2 then
-                    AddASAP("Add 1–2 T1 converters (smooth T2 start)", "warn")
-                end
             end
         else
             AddASAP("Energy overflowing → build energy storage (stop waste)", "warn")
         end
     end
 
-    if energyDipping and converterCount > 0 then
-        AddASAP("Energy dipping → adjust conversion slider → less Metal (save Energy)", "warn")
+    if ecoComfort and idleFactoryCount > 0 then
+        AddASAP(("Idle factory detected (%d) → queue units"):format(idleFactoryCount), "warn")
     end
 
-    -- Buildpower Todo triggers (eco-gated)
-    if ecoComfort and not projectActive then
-        local floatingMetal = (mPct > 0.60) or (mNetEMA > 2)
-        local floatingEnergy = (ePct > 0.70) or (eNetEMA > 6) or (eCur > 12000)
-
-        if (floatingMetal or (floatingEnergy and metalPressure)) then
-            if currentPhaseKey == "t1Bridge" and buildPowerCount < 4 then
-                AddASAP("Floating eco → add buildpower (1 constructor)", "good")
-            elseif (currentPhaseKey == "t2" or currentPhaseKey == "t3") and (constructionTurretCount < 1 and buildPowerCount < 6) then
-                AddASAP("Spending slow → build 1 Construction Turret", "good")
-            end
-        end
-    end
-
-    if (buildPowerCount >= 6) and (energyDipping or eNetRaw < -6) then
-        AddASAP("Buildpower spike risk → stop assisting / pause extra builders", "warn")
-    end
-
-    -- Phase-critical guidance
+    -- Minimal phase todo (keeps noise down)
     if currentPhaseKey == "opening" then
         if not hasT1Factory then AddASAP("Build T1 Bot Lab NOW", "warn") end
         if windCount < 5 then AddASAP("Build Wind (aim 5+)", "warn") end
         if mexCount < 2 then AddASAP("Capture mex (2+)", "warn") end
-
     elseif currentPhaseKey == "t1Bridge" then
         if mexCount < 4 then AddASAP("Expand: secure 4+ mex", "warn") end
         if radarCount < 1 then AddASAP("Build radar building (awareness)", "warn") end
-
         if metalLow and energyRich then
-            if converterCount == 0 then
-                AddASAP("Metal tight + energy rich → build T1 converters", "good")
-            else
-                AddASAP("Metal tight → adjust conversion slider → more Metal", "good")
-            end
+            AddASAP("Metal tight + energy rich → converters / slider to Metal", "good")
         end
-
-        if #todo == 0 and AllMilestonesDone() then
-            if not energySafe then
-                AddASAP("Prep T2: add power buffer", "prep")
-                AddASAP("Blocked by: Energy dipping", "block")
-            else
-                AddASAP("Prep T2: bank metal (convert if needed)", "prep")
-            end
-        end
-
     elseif currentPhaseKey == "tech" then
         if not (buildingT2Factory or hasT2Factory) then
-            if energySafe and not energyDipping and not metalPressure then
-                AddASAP("Start T2 Factory (safe window)", "good")
-            else
-                AddASAP("Prep T2 Factory", "warn")
-                if energyDipping then AddASAP("Blocked by: Energy dipping", "block") end
-                if metalPressure then AddASAP("Blocked by: Metal too low (bank/convert)", "block") end
-            end
+            AddASAP("Prep / start T2 Factory when stable", "warn")
         else
             if metalPressure and energyRich then
                 AddASAP("Project spend + metal pressure → scale converters", "warn")
-                AddASAP("Adjust conversion slider → more Metal", "good")
-            elseif metalPressure then
-                AddASAP("Protect metal: reduce assisting / pause extras", "warn")
-            end
-
-            if energyDipping then
-                AddASAP("Stabilise: pause extra builds to finish T2", "warn")
-                AddASAP("Blocked by: Energy dipping", "block")
-            else
-                AddASAP("Finish T2 clean (avoid hard stall)", "good")
             end
         end
-
     elseif currentPhaseKey == "t2" then
-        if t2BuilderCount < 1 then
-            AddASAP("Get a T2 constructor ASAP", "warn")
-            AddASAP("Blocked by: Need T2 factory online", (hasT2Factory and "prep" or "block"))
-        end
+        if t2BuilderCount < 1 then AddASAP("Get a T2 constructor ASAP", "warn") end
         if mexUpgradedCount < 3 then AddASAP("Upgrade mex (aim 3+)", "warn") end
-
-        if metalPressure and energyRich then
-            if t2ConverterCount < 4 then AddASAP("Prep T3: build T2 converters (aim 4+)", "good") end
-            if converterCount > 0 then AddASAP("Prep T3: adjust conversion slider → more Metal", "good") end
+        if metalPressure and energyRich and t2ConverterCount < 4 then
+            AddASAP("Prep T3: build T2 converters (aim 4+)", "good")
         end
-
     elseif currentPhaseKey == "t3" then
         if (reactorCount == 0 and afusCount == 0) then
-            if energySafe and not energyDipping and not metalPressure then
-                AddASAP("Start Fusion/AFUS (safe window)", "good")
-            else
-                AddASAP("Prep Fusion/AFUS", "warn")
-                if energyDipping then AddASAP("Blocked by: Energy dipping", "block") end
-                if metalPressure then AddASAP("Blocked by: Metal too low (convert/bank)", "block") end
-            end
+            AddASAP("Start Fusion/AFUS when stable", "warn")
         end
-
-        if metalPressure and energyRich and (t2ConverterCount < 6) then
-            AddASAP("Scale T2 converters (feed T3 soon)", "good")
-        end
-
-    else
         if metalPressure and energyRich then
-            AddASAP("Metal tight: add converters before big spends", "warn")
-            AddASAP("Adjust conversion slider → more Metal", "good")
-        elseif ecoComfort and idleFactoryCount > 0 then
-            AddASAP("Endgame: keep factories queued (tempo)", "warn")
-        else
-            AddASAP("Spend eco into production (avoid floating)", "good")
+            AddASAP("Scale converters so Metal doesn’t choke", "good")
         end
-    end
-
-    -- Prep fallback if Todo empty + on track + milestones done
-    local onTrack = (phaseColor[1] > 0.55 and phaseColor[2] > 0.9)
-    if (#todo == 0) and onTrack and AllMilestonesDone() then
-        local function AddPREP(text)
-            if #todo < 3 then Add(todo, "Prep: " .. text, "prep") end
-        end
-
-        if currentPhaseKey == "opening" then
-            AddPREP("keep wind climbing (buffer for expansion)")
-            AddPREP("secure extra mex if safe")
-        elseif currentPhaseKey == "t2" then
-            AddPREP("prepare spine: power + converters")
-            AddPREP("avoid idle factories (keep tempo)")
-        elseif currentPhaseKey == "t3" then
-            AddPREP("stabilise eco spine before huge queues")
-            AddPREP("scale converters so metal doesn’t choke endgame")
-        else
-            AddPREP("keep spending — eco idle is lost tempo")
-        end
+    else
+        AddASAP("Spend eco into production (avoid floating)", "good")
     end
 end
 
 --------------------------------------------------------------------------------
--- DRAW (centered + colored arrows + readiness + WHY + lens)
+-- DRAW
 --------------------------------------------------------------------------------
 
 function widget:DrawScreen()
@@ -942,14 +785,12 @@ function widget:DrawScreen()
     local y = vsy * 0.86
     local line = fontSize * 1.25
 
-    -- Rhythm base line
     local prefix = "Rhythm: " .. ecoLabel .. " — "
     local baseLine = prefix .. "E " .. eArrow .. "  M " .. mArrow
 
     gl.Color(rhythmColor)
     gl.Text(baseLine, cx, y, fontSize*1.6, "oc")
 
-    -- overlay colored arrows (approx)
     local totalW = gl.GetTextWidth(baseLine) * (fontSize*1.6)
     local xLeft = cx - (totalW * 0.5)
     local wPrefix = gl.GetTextWidth(prefix) * (fontSize*1.6)
@@ -957,44 +798,27 @@ function widget:DrawScreen()
     local xE = xLeft + wPrefix + gl.GetTextWidth("E ") * (fontSize*1.6)
     local xM = xLeft + wPrefix + gl.GetTextWidth("E " .. eArrow .. "  M ") * (fontSize*1.6)
 
-    gl.Color(eArrowColor)
-    gl.Text(eArrow, xE, y, fontSize*1.6, "o")
-
-    gl.Color(mArrowColor)
-    gl.Text(mArrow, xM, y, fontSize*1.6, "o")
+    gl.Color(eArrowColor); gl.Text(eArrow, xE, y, fontSize*1.6, "o")
+    gl.Color(mArrowColor); gl.Text(mArrow, xM, y, fontSize*1.6, "o")
 
     y = y - line*1.2
 
-    -- Phase
     gl.Color(phaseColor[1], phaseColor[2], phaseColor[3], phaseColor[4])
     gl.Text("Phase: "..phaseLabel, cx, y, fontSize*1.15, "oc")
     y = y - line
 
-    -- Readiness
     if readinessText ~= "" then
         gl.Color(readinessColor[1], readinessColor[2], readinessColor[3], readinessColor[4])
         gl.Text(readinessText, cx, y, fontSize*1.05, "oc")
         y = y - line*0.95
 
         if readinessWhyText ~= "" then
-            gl.Color(readinessWhyColor[1], readinessWhyColor[2], readinessWhyColor[3], readinessWhyColor[4])
+            gl.Color(0.8,0.85,1,1)
             gl.Text(readinessWhyText, cx, y, fontSize*0.98, "oc")
             y = y - line
-        else
-            y = y - line*0.4
         end
     end
 
-    -- Lens line
-    if lensText ~= "" then
-        gl.Color(lensColor[1], lensColor[2], lensColor[3], lensColor[4])
-        gl.Text(lensText, cx, y, fontSize*1.02, "oc")
-        y = y - line*1.2
-    else
-        y = y - line*0.6
-    end
-
-    -- Milestones header
     gl.Color(0.75, 0.9, 1, 1)
     gl.Text("Milestones", cx, y, fontSize*1.12, "oc")
     y = y - line
@@ -1010,7 +834,6 @@ function widget:DrawScreen()
 
     y = y - line*0.5
 
-    -- Todo header
     gl.Color(1, 0.9, 0.35, 1)
     gl.Text("Todo (ASAP / Prep)", cx, y, fontSize*1.12, "oc")
     y = y - line
@@ -1032,15 +855,13 @@ end
 --------------------------------------------------------------------------------
 
 function widget:GameFrame(f)
-    if f % 30 ~= 0 then return end -- ~1s
+    if f % 30 ~= 0 then return end
 
-    -- projectActive computed from last unit scan; do quick prediction using cached flags too
     local projectActive = buildingT2Factory or anyFactoryBuilding or bigSpendBuilding or bigProjectBuilding
 
     UpdateEconomy(projectActive)
     UpdateUnits()
 
-    -- recompute with fresh unit scan (more accurate for this tick)
     projectActive = buildingT2Factory or anyFactoryBuilding or bigSpendBuilding or bigProjectBuilding
 
     UpdatePhase(Spring.GetGameSeconds())
