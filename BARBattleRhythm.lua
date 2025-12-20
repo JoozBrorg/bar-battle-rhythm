@@ -47,6 +47,9 @@ local readinessWhyText = ""
 local readinessColor = {0.85, 0.9, 1, 1}
 local readinessWhyColor = {0.8, 0.85, 1, 1}
 
+local lastT2Score = 0
+local lastT3Score = 0
+
 local lensText = ""
 local lensColor = {0.85, 0.9, 1, 1}
 -- Status line (explains context / why suggestions)
@@ -810,7 +813,7 @@ local function UpdateGuidance(projectActive)
         Add(milestones,"Next Phase: T3 Transition","hint")
     elseif currentPhaseKey == "t3" then
         Add(milestones,"Eco spine: Fusion/AFUS online",nil,done((reactorCount > 0 or afusCount > 0)))
-        Add(milestones,"T2 eco stable (no crashing)",nil,done(ePct > 0.2 and mPct > 0.2))
+        Add(milestones,"T2 eco stable (no crashing)",nil,done((ecoLabel ~= "Crashing Eco") and (lastT3Score >= 75)))
         AddBuildpowerMilestones()
         Add(milestones,"Next Phase: Endgame","hint")
     else
@@ -852,6 +855,7 @@ local function UpdateGuidance(projectActive)
 
     if currentPhaseKey == "t1Bridge" or currentPhaseKey == "tech" then
         local score, label, col, why = ReadinessForT2(projectActive)
+        lastT2Score = score
         if projectActive then
             readinessText = ("T2 Build: IN PROGRESS — %d (%s)"):format(score, label)
         else
@@ -862,6 +866,7 @@ local function UpdateGuidance(projectActive)
         readinessWhyColor = {0.8, 0.85, 1, 1}
     elseif currentPhaseKey == "t2" or currentPhaseKey == "t3" then
         local score, label, col, why = ReadinessForT3(projectActive)
+        lastT3Score = score
         if projectActive and (anyFactoryBuilding or bigSpendBuilding) then
             readinessText = ("T3 Prep: PROJECT ACTIVE — %d (%s)"):format(score, label)
         else
