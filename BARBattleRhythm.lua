@@ -21,6 +21,18 @@ end
 --------------------------------------------------------------------------------
 
 local fontSize = 14
+-- UI options (Settings > Custom)
+local uiScale = 1.0
+local anchorX = 0.5
+local anchorY = 0.86
+
+local showPhaseLine    = true
+local showReadiness    = true
+local showStatusLine   = true
+local showMilestones   = true
+local showTodo         = true
+local showFocusOptions = true
+
 
 local ecoLabel = "Initialising…"
 local rhythmColor = {0.8, 0.85, 0.9, 1}
@@ -37,6 +49,60 @@ local readinessWhyColor = {0.8, 0.85, 1, 1}
 
 local lensText = ""
 local lensColor = {0.85, 0.9, 1, 1}
+-- Status line (explains context / why suggestions)
+local statusText = ""
+local statusColor = {0.85, 0.9, 1, 1}
+
+-- Anti-flicker smoothing (Step 3)
+local SMOOTH_HOLD_SEC = 1.6
+local smooth = { applied={}, appliedColor={}, cand={}, candColor={}, since={} }
+
+local function SmoothTextColor(key, newText, newColor, nowSec, holdSec, force)
+    holdSec = holdSec or SMOOTH_HOLD_SEC
+    local a = smooth.applied[key]
+    if a == nil then
+        smooth.applied[key] = newText or ""
+        smooth.appliedColor[key] = newColor
+        smooth.cand[key] = nil
+        smooth.since[key] = nil
+        return smooth.applied[key], smooth.appliedColor[key]
+    end
+
+    newText = newText or ""
+    if force or newText == a then
+        if force and newText ~= a then
+            smooth.applied[key] = newText
+            smooth.appliedColor[key] = newColor
+        end
+        smooth.cand[key] = nil
+        smooth.since[key] = nil
+        return smooth.applied[key], smooth.appliedColor[key]
+    end
+
+    -- New candidate
+    if smooth.cand[key] ~= newText then
+        smooth.cand[key] = newText
+        smooth.candColor[key] = newColor
+        smooth.since[key] = nowSec
+        return smooth.applied[key], smooth.appliedColor[key]
+    end
+
+    -- Candidate has persisted long enough
+    if (nowSec - (smooth.since[key] or nowSec)) >= holdSec then
+        smooth.applied[key] = smooth.cand[key]
+        smooth.appliedColor[key] = smooth.candColor[key]
+        smooth.cand[key] = nil
+        smooth.since[key] = nil
+    end
+
+    return smooth.applied[key], smooth.appliedColor[key]
+end
+
+local function IsUrgentStatus(text)
+    text = (text or ""):lower()
+    return text:find("crash") or text:find("blocked") or text:find("project")
+end
+
 
 -- Per-resource arrow + color
 local eArrow, mArrow = "→", "→"
@@ -110,6 +176,7 @@ local mCrashTicks = 0
 
 local milestones = {}
 local todo = {}
+local focus = {}
 
 local function Clear(t)
     for i = #t, 1, -1 do t[i] = nil end
@@ -235,12 +302,30 @@ end
 --------------------------------------------------------------------------------
 
 local function FactoryIsActive(uid)
+    -- 1) Actively constructing a unit right now
     local buildTarget = Spring.GetUnitIsBuilding(uid)
-    if buildTarget then return true end
+    if buildTarget then
+        return true
+    end
 
+    -- 2) A production queue exists (BAR factories use negative unitDefIDs in command queue)
+    local cmds = Spring.GetCommandQueue(uid, 20)
+    if cmds and #cmds > 0 then
+        for i = 1, #cmds do
+            local id = cmds[i].id
+            -- negative IDs are build/unit orders
+            if id and id < 0 then
+                return true
+            end
+        end
+    end
+
+    -- 3) Fallback: engine-supported build queue API
     if Spring.GetFullBuildQueue then
         local q = Spring.GetFullBuildQueue(uid)
-        if q and next(q) ~= nil then return true end
+        if q and next(q) ~= nil then
+            return true
+        end
     end
 
     return false
@@ -430,6 +515,9 @@ local function ArrowFrom(netEMA, pct, intentSpend)
 
     if netEMA > upT then return "↑","good" end
     if netEMA > flatT then return "→","ok" end
+    -- If buffers are healthy, don’t scare the player with a ↓ just because they are spending.
+    if pct > 0.55 and netEMA > -20 then return "→","ok" end
+    if pct > 0.35 and netEMA > -10 then return "→","ok" end
     if pct > 0.15 then
         return intentSpend and "↘" or "↓", intentSpend and "ok" or "warn"
     end
@@ -547,7 +635,7 @@ local function ReadinessForT2(projectActive)
         if penaltyText == "" then penaltyText = "Project in progress — protect buffers" end
     end
 
-    if buildPowerCount >= 6 and ((ePct < 0.35 and eCur < 6000) or eNetEMA < -2) then
+    if projectActive and buildPowerCount >= 7 and ((ePct < 0.22 and eCur < 4500) or eNetEMA < -10) and ((mCur < 400 and mPct < 0.25) or mNetEMA < -6) then
         penalty = penalty + 15
         penaltyText = ("Buildpower spike risk (%d builders)"):format(buildPowerCount)
     end
@@ -629,7 +717,45 @@ local function UpdateLens()
     else
         lensText = "Lens: Balanced — keep tempo & prep next window"
         lensColor = {0.85,0.9,1,1}
+    -- Anti-flicker: smooth lens text to avoid rapid mode flips
+    local nowSec = Spring.GetGameSeconds()
+    lensText, lensColor = SmoothTextColor("lens", lensText, lensColor, nowSec, SMOOTH_HOLD_SEC, IsUrgentStatus(lensText))
     end
+
+
+function UpdateStatusLine(projectActive, milestonesDone)
+    -- Keep this calm + descriptive. Never command.
+    if projectActive then
+        statusText = "Status: Project in progress — protect buffers, avoid over-assist"
+        statusColor = {1, 0.9, 0.35, 1}
+        return
+    end
+
+    -- Eco stress states (use ecoLabel as player-facing summary)
+    if ecoLabel:find("Crashing") then
+        statusText = "Status: Eco crashing — stabilise before committing"
+        statusColor = {1, 0.35, 0.35, 1}
+        return
+    end
+    if ecoLabel:find("Tight") or ecoLabel:find("Leaning") or ecoLabel:find("Converting") then
+        statusText = "Status: Eco stressed — stabilise, then choose next focus"
+        statusColor = {1, 0.75, 0.35, 1}
+        return
+    end
+
+    -- Stable
+    if milestonesDone and (#todo == 0) then
+        statusText = "Status: Eco stable — choose a focus (eco consistency / tempo / tech prep)"
+        statusColor = {0.75, 0.95, 1, 1}
+    else
+        statusText = "Status: Eco stable — complete phase items, then pick a focus"
+        statusColor = {0.85, 0.9, 1, 1}
+    end
+    -- Anti-flicker: smooth status text; urgent states swap immediately
+    local nowSec = Spring.GetGameSeconds()
+    local force = projectActive or IsUrgentStatus(statusText)
+    statusText, statusColor = SmoothTextColor("status", statusText, statusColor, nowSec, SMOOTH_HOLD_SEC, force)
+end
 end
 
 --------------------------------------------------------------------------------
@@ -639,6 +765,7 @@ end
 local function UpdateGuidance(projectActive)
     Clear(milestones)
     Clear(todo)
+    Clear(focus)
 
     local t = Spring.GetGameSeconds()
     phaseColor = PhaseTimingColor(currentPhaseKey, t)
@@ -688,7 +815,7 @@ local function UpdateGuidance(projectActive)
         Add(milestones,"Next Phase: Endgame","hint")
     else
         Add(milestones,"T3 online (if/when built)",nil,done(hasT3Factory))
-        Add(milestones,"Spend eco into production",nil,nil)
+        Add(milestones,"Spend eco into production",nil, done(factoryCount > 0 and idleFactoryCount == 0))
         Add(milestones,"Next Phase: —","hint")
     end
 
@@ -713,7 +840,8 @@ local function UpdateGuidance(projectActive)
     local energyDipping = (eNetEMA < -6) or (ePct < 0.18 and eCur < 2500)
     local energyCrash   = (ePct < 0.10 and eCur < 1200) and (eNetEMA < -10)
 
-    local metalLow      = (mPct < 0.35) or (mCur < 220)
+    local metalLow      = (mCur < 220) or ((mPct < 0.20) and (mCur < 800))
+    if mCur > 3000 then metalLow = false end -- ignore % when banked metal is high
     local metalPressure = metalLow or (mNetEMA < -3) or (mNetRaw < -5)
 
     local energyRich    = (ePct > 0.60) or (eNetEMA > 6) or (eCur > 9000)
@@ -743,6 +871,14 @@ local function UpdateGuidance(projectActive)
         readinessColor = col
         readinessWhyColor = {0.8, 0.85, 1, 1}
     end
+    -- Anti-flicker: smooth readiness lines (project swaps immediately)
+    do
+        local nowSec = Spring.GetGameSeconds()
+        local force = projectActive
+        readinessText, readinessColor = SmoothTextColor("readiness", readinessText, readinessColor, nowSec, 1.2, force)
+        readinessWhyText, readinessWhyColor = SmoothTextColor("readinessWhy", readinessWhyText, readinessWhyColor, nowSec, 1.2, force)
+    end
+
 
     -- Emergency (energy)
     if energyCrash then
@@ -930,6 +1066,81 @@ local function UpdateGuidance(projectActive)
             AddPREP("keep spending — eco idle is lost tempo")
         end
     end
+
+    
+    ------------------------------------------------------------------------
+    -- Focus Options (Hybrid coaching)
+    -- Shows 2–3 neutral "lanes" when eco is comfortable (OS50-style choices)
+    ------------------------------------------------------------------------
+    local function AddFocusLine(txt)
+        Add(focus, txt, {0.85,0.9,1,1}, nil)
+    end
+
+    local function AddFocusOptions()
+        if not ecoComfort then return end
+        if ecoLabel ~= "Stable Eco" then return end
+
+        local maxLines = 3
+        local function push(txt)
+            if #focus < maxLines then AddFocusLine(txt) end
+        end
+
+        -- During projects: protective guidance only (soft)
+        if projectActive then
+            push("During project: protect buffers (avoid stalls)")
+            if buildPowerCount >= 7 and ((eNetEMA < -10) or (mNetEMA < -6)) then
+                push("During project: avoid over-assist if eco is dipping")
+            end
+            if (ePct > 0.75 or eCur > 9000) and (mCur < 600) and (converterCount < 4) then
+                push("After project: add converters / adjust conversion slider")
+            end
+            return
+        end
+
+        -- Behaviour bias (light): only when eco is comfortable
+        if idleFactoryCount > 0 then
+            push("Tempo: keep factories producing (avoid idle time)")
+        end
+
+        -- Phase bias (light)
+        if currentPhaseKey == "opening" or currentPhaseKey == "t1Bridge" then
+            push("Eco consistency: smooth power (wind/storage) before tech")
+            push("Map focus: scout/expand while eco is stable")
+        elseif currentPhaseKey == "tech" then
+            push("Prep tech: bank metal + keep power steady")
+            push("Eco consistency: prevent dips before starting T2")
+        elseif currentPhaseKey == "t2" then
+            push("Buildpower: add 1–2 builders/turrets if eco allows")
+            push("Eco consistency: scale converters if metal is the choke")
+        elseif currentPhaseKey == "t3" then
+            push("Prep T3: bank metal + keep eco spine smooth")
+            push("Tempo: turn eco into production (avoid idle)")
+        else
+            push("Endgame: spend eco into production (avoid idle)")
+            push("Eco consistency: prevent stalls under big queues")
+        end
+
+        -- If we still have room, add a gentle universal option
+        if #focus < maxLines then
+            push("Optional: add storage to reduce small waste/spikes")
+        end
+    end
+
+    -- Show focus options when nothing urgent is screaming (todo light), or milestones mostly complete
+    local function ShouldShowFocus()
+        if #todo == 0 then return true end
+        if AllMilestonesDone and AllMilestonesDone() then return true end
+        return false
+    end
+
+    if ShouldShowFocus() then
+        AddFocusOptions()
+    end
+
+
+-- Status line (why / context)
+    UpdateStatusLine(projectActive, AllMilestonesDone())
+
 end
 
 --------------------------------------------------------------------------------
@@ -938,65 +1149,80 @@ end
 
 function widget:DrawScreen()
     local vsx,vsy = Spring.GetViewGeometry()
-    local cx = vsx * 0.5
-    local y = vsy * 0.86
-    local line = fontSize * 1.25
+    local cx = vsx * anchorX
+    local y = vsy * anchorY
+    local fs = fontSize * uiScale
+    local line = fs * 1.25
 
     -- Rhythm base line
     local prefix = "Rhythm: " .. ecoLabel .. " — "
     local baseLine = prefix .. "E " .. eArrow .. "  M " .. mArrow
 
     gl.Color(rhythmColor)
-    gl.Text(baseLine, cx, y, fontSize*1.6, "oc")
+    gl.Text(baseLine, cx, y, fs * 1.6, "oc")
 
     -- overlay colored arrows (approx)
-    local totalW = gl.GetTextWidth(baseLine) * (fontSize*1.6)
+    local totalW = gl.GetTextWidth(baseLine) * (fs * 1.6)
     local xLeft = cx - (totalW * 0.5)
-    local wPrefix = gl.GetTextWidth(prefix) * (fontSize*1.6)
+    local wPrefix = gl.GetTextWidth(prefix) * (fs * 1.6)
 
-    local xE = xLeft + wPrefix + gl.GetTextWidth("E ") * (fontSize*1.6)
-    local xM = xLeft + wPrefix + gl.GetTextWidth("E " .. eArrow .. "  M ") * (fontSize*1.6)
+    local xE = xLeft + wPrefix + gl.GetTextWidth("E ") * (fs * 1.6)
+    local xM = xLeft + wPrefix + gl.GetTextWidth("E " .. eArrow .. "  M ") * (fs * 1.6)
 
     gl.Color(eArrowColor)
-    gl.Text(eArrow, xE, y, fontSize*1.6, "o")
+    gl.Text(eArrow, xE, y, fs * 1.6, "o")
 
     gl.Color(mArrowColor)
-    gl.Text(mArrow, xM, y, fontSize*1.6, "o")
+    gl.Text(mArrow, xM, y, fs * 1.6, "o")
 
     y = y - line*1.2
 
+    if showPhaseLine then
     -- Phase
     gl.Color(phaseColor[1], phaseColor[2], phaseColor[3], phaseColor[4])
-    gl.Text("Phase: "..phaseLabel, cx, y, fontSize*1.15, "oc")
+    gl.Text("Phase: "..phaseLabel, cx, y, fs * 1.15, "oc")
     y = y - line
 
+    end
+    if showReadiness then
     -- Readiness
     if readinessText ~= "" then
         gl.Color(readinessColor[1], readinessColor[2], readinessColor[3], readinessColor[4])
-        gl.Text(readinessText, cx, y, fontSize*1.05, "oc")
+        gl.Text(readinessText, cx, y, fs * 1.05, "oc")
         y = y - line*0.95
 
         if readinessWhyText ~= "" then
             gl.Color(readinessWhyColor[1], readinessWhyColor[2], readinessWhyColor[3], readinessWhyColor[4])
-            gl.Text(readinessWhyText, cx, y, fontSize*0.98, "oc")
+            gl.Text(readinessWhyText, cx, y, fs * 0.98, "oc")
             y = y - line
         else
             y = y - line*0.4
         end
     end
 
+    end
+    if showStatusLine then
+    -- Status line
+    if statusText ~= "" then
+        gl.Color(statusColor[1], statusColor[2], statusColor[3], statusColor[4])
+        gl.Text(statusText, cx, y, fs * 1.02, "oc")
+        y = y - line*1.05
+    end
+
     -- Lens line
     if lensText ~= "" then
         gl.Color(lensColor[1], lensColor[2], lensColor[3], lensColor[4])
-        gl.Text(lensText, cx, y, fontSize*1.02, "oc")
+        gl.Text(lensText, cx, y, fs * 1.02, "oc")
         y = y - line*1.2
     else
         y = y - line*0.6
     end
 
+    end
+    if showMilestones then
     -- Milestones header
     gl.Color(0.75, 0.9, 1, 1)
-    gl.Text("Milestones", cx, y, fontSize*1.12, "oc")
+    gl.Text("Milestones", cx, y, fs * 1.12, "oc")
     y = y - line
 
     for _,m in ipairs(milestones) do
@@ -1004,15 +1230,17 @@ function widget:DrawScreen()
         if m.status=="done" then r,g,b = 0.6,1,0.6
         elseif m.color=="hint" then r,g,b = 0.8,0.85,1 end
         gl.Color(r,g,b,1)
-        gl.Text((m.status=="done" and "✓ " or "• ")..m.text, cx, y, fontSize*1.02, "oc")
+        gl.Text((m.status=="done" and "✓ " or "• ")..m.text, cx, y, fs * 1.02, "oc")
         y = y - line
     end
 
     y = y - line*0.5
 
+    end
+    if showTodo then
     -- Todo header
     gl.Color(1, 0.9, 0.35, 1)
-    gl.Text("Todo (ASAP / Prep)", cx, y, fontSize*1.12, "oc")
+    gl.Text("Todo (ASAP / Prep)", cx, y, fs * 1.12, "oc")
     y = y - line
 
     for _,t in ipairs(todo) do
@@ -1022,9 +1250,29 @@ function widget:DrawScreen()
         elseif t.color=="block" then r,g,b=1,0.5,0.5
         elseif t.color=="prep" then r,g,b=0.75,0.9,1 end
         gl.Color(r,g,b,1)
-        gl.Text("• "..t.text, cx, y, fontSize*1.05, "oc")
+        gl.Text("• "..t.text, cx, y, fs * 1.05, "oc")
         y = y - line
     end
+
+    end
+    -- Focus Options (shown only when available)
+    if showFocusOptions and #focus > 0 then
+        y = y - line*0.4
+        gl.Color(0.85, 0.9, 1, 1)
+        gl.Text("Focus options", cx, y, fs * 1.08, "oc")
+        y = y - line
+        for _,f in ipairs(focus) do
+            local r,g,b = 0.85,0.9,1
+            if f.color=="good" then r,g,b=0.7,1,0.7
+            elseif f.color=="warn" then r,g,b=1,0.8,0.4
+            elseif f.color=="block" then r,g,b=1,0.5,0.5
+            elseif f.color=="prep" then r,g,b=0.75,0.9,1 end
+            gl.Color(r,g,b,1)
+            gl.Text("• "..f.text, cx, y, fs * 1.02, "oc")
+            y = y - line
+        end
+    end
+
 end
 
 --------------------------------------------------------------------------------
@@ -1046,4 +1294,96 @@ function widget:GameFrame(f)
     UpdatePhase(Spring.GetGameSeconds())
     UpdateRhythm(projectActive)
     UpdateGuidance(projectActive)
+end
+--------------------------------------------------------------------------------
+-- SETTINGS (Settings > Custom)
+--------------------------------------------------------------------------------
+
+function widget:Initialize()
+    if not (WG and WG.options and WG.options.addOption) then
+        return
+    end
+
+    local function SafeAdd(opt)
+        pcall(WG.options.addOption, opt)
+    end
+
+    local wname = "BAR: Battle Rhythm"
+    local group = "custom"
+    local category = 2
+
+    SafeAdd({
+        widgetname = wname,
+        id = "br_ui_scale",
+        group = group,
+        category = category,
+        name = "UI Scale",
+        type = "slider",
+        min = 0.75,
+        max = 1.75,
+        step = 0.05,
+        value = uiScale,
+        description = "Scale the Battle Rhythm UI.",
+        onchange = function(_, value)
+            uiScale = tonumber(value) or uiScale
+        end
+    })
+
+    SafeAdd({
+        widgetname = wname,
+        id = "br_pos_x",
+        group = group,
+        category = category,
+        name = "Position X",
+        type = "slider",
+        min = 0.05,
+        max = 0.95,
+        step = 0.01,
+        value = anchorX,
+        description = "Horizontal position of the UI (0=left, 1=right).",
+        onchange = function(_, value)
+            anchorX = tonumber(value) or anchorX
+        end
+    })
+
+    SafeAdd({
+        widgetname = wname,
+        id = "br_pos_y",
+        group = group,
+        category = category,
+        name = "Position Y",
+        type = "slider",
+        min = 0.05,
+        max = 0.95,
+        step = 0.01,
+        value = anchorY,
+        description = "Vertical position of the UI (0=bottom, 1=top).",
+        onchange = function(_, value)
+            anchorY = tonumber(value) or anchorY
+        end
+    })
+
+    -- Section toggles (shown if your options UI supports bool types)
+    local function AddToggle(id, label, getterSetter)
+        SafeAdd({
+            widgetname = wname,
+            id = id,
+            group = group,
+            category = category,
+            name = label,
+            type = "bool",
+            value = getterSetter(),
+            description = "Show/hide this section.",
+            onchange = function(_, value)
+                getterSetter(value)
+            end
+        })
+    end
+
+    AddToggle("br_show_phase", "Show Phase", function(v) if v ~= nil then showPhaseLine = v end return showPhaseLine end)
+    AddToggle("br_show_readiness", "Show Readiness", function(v) if v ~= nil then showReadiness = v end return showReadiness end)
+    AddToggle("br_show_status", "Show Status line", function(v) if v ~= nil then showStatusLine = v end return showStatusLine end)
+    AddToggle("br_show_milestones", "Show Milestones", function(v) if v ~= nil then showMilestones = v end return showMilestones end)
+    AddToggle("br_show_todo", "Show Todo", function(v) if v ~= nil then showTodo = v end return showTodo end)
+    AddToggle("br_show_focus", "Show Focus options", function(v) if v ~= nil then showFocusOptions = v end return showFocusOptions end)
 end
