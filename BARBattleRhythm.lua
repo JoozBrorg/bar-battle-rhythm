@@ -494,7 +494,7 @@ local function UpdatePhase(t)
 
     if hasT2Factory and not hasT3Factory then
         if (reactorCount > 0 or afusCount > 0) then
-            SetPhase("t3","T3 Transition — Eco spine online (8:00–11:00)")
+            SetPhase("t3","T3 Transition — Fusion/AFUS online (8:00–11:00)")
         else
             SetPhase("t2","T2 Spike — Upgrade mex & convert eco (5:00–8:00)")
         end
@@ -538,6 +538,8 @@ local function UpdateRhythm(projectActive)
     local intentSpend = projectActive and (ePct > 0.35)
     local conversionLikely = (converterCount > 0) and (mNetEMA > 0) and (eNetEMA < 0) and (ePct > 0.2)
 
+    local lateGameEco = (hasT3Factory or mInc > 25 or eInc > 6000 or mCur > 2000 or eCur > 15000)
+
     local eA, eState = ArrowFrom(eNetEMA, ePct, intentSpend)
     local mA, mState = ArrowFrom(mNetEMA, mPct, false)
 
@@ -548,6 +550,13 @@ local function UpdateRhythm(projectActive)
     local label = "Stable Eco"
     local crashing = (eState=="danger") or (mState=="danger")
     local tight = (eState=="warn") or (mState=="warn")
+
+    -- If we're late-game (very high income/banks), avoid scary language for normal project spend.
+    if crashing and lateGameEco and (ePct > 0.20 or eCur > 3000) and (mCur > 300 or mPct > 0.12) then
+        label = "Heavy Spend — Watch Buffers"
+        crashing = false
+        tight = true
+    end
 
     if crashing then
         label = "Crashing Eco"
@@ -812,7 +821,7 @@ local function UpdateGuidance(projectActive)
         AddBuildpowerMilestones()
         Add(milestones,"Next Phase: T3 Transition","hint")
     elseif currentPhaseKey == "t3" then
-        Add(milestones,"Eco spine: Fusion/AFUS online",nil,done((reactorCount > 0 or afusCount > 0)))
+        Add(milestones,"Power spine: Fusion/AFUS online",nil,done((reactorCount > 0 or afusCount > 0)))
         Add(milestones,"T2 eco stable (no crashing)",nil,done((ecoLabel ~= "Crashing Eco") and (lastT3Score >= 75)))
         AddBuildpowerMilestones()
         Add(milestones,"Next Phase: Endgame","hint")
@@ -1300,6 +1309,40 @@ function widget:GameFrame(f)
     UpdateRhythm(projectActive)
     UpdateGuidance(projectActive)
 end
+
+--------------------------------------------------------------------------------
+-- CONFIG (persist Settings > Custom across restarts)
+--------------------------------------------------------------------------------
+
+function widget:GetConfigData()
+    return {
+        uiScale = uiScale,
+        anchorX = anchorX,
+        anchorY = anchorY,
+        showPhaseLine = showPhaseLine,
+        showReadiness = showReadiness,
+        showStatusLine = showStatusLine,
+        showMilestones = showMilestones,
+        showTodo = showTodo,
+        showFocusOptions = showFocusOptions,
+    }
+end
+
+function widget:SetConfigData(data)
+    if type(data) ~= "table" then return end
+
+    if type(data.uiScale) == "number" then uiScale = data.uiScale end
+    if type(data.anchorX) == "number" then anchorX = data.anchorX end
+    if type(data.anchorY) == "number" then anchorY = data.anchorY end
+
+    if type(data.showPhaseLine) == "boolean" then showPhaseLine = data.showPhaseLine end
+    if type(data.showReadiness) == "boolean" then showReadiness = data.showReadiness end
+    if type(data.showStatusLine) == "boolean" then showStatusLine = data.showStatusLine end
+    if type(data.showMilestones) == "boolean" then showMilestones = data.showMilestones end
+    if type(data.showTodo) == "boolean" then showTodo = data.showTodo end
+    if type(data.showFocusOptions) == "boolean" then showFocusOptions = data.showFocusOptions end
+end
+
 --------------------------------------------------------------------------------
 -- SETTINGS (Settings > Custom)
 --------------------------------------------------------------------------------
@@ -1342,7 +1385,7 @@ function widget:Initialize()
         name = "Position X",
         type = "slider",
         min = 0.05,
-        max = 0.95,
+        max = 0.99,
         step = 0.01,
         value = anchorX,
         description = "Horizontal position of the UI (0=left, 1=right).",
@@ -1359,7 +1402,7 @@ function widget:Initialize()
         name = "Position Y",
         type = "slider",
         min = 0.05,
-        max = 0.95,
+        max = 0.99,
         step = 0.01,
         value = anchorY,
         description = "Vertical position of the UI (0=bottom, 1=top).",
