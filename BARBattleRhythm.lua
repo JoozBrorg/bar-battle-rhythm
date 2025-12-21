@@ -287,8 +287,15 @@ local function UpdateEconomy(projectActive)
     local alpha = EMA_ALPHA_BASE
     if projectActive then alpha = 0.40 end -- faster response during big spends
 
+    -- In replays/spectating, GetTeamResources can return nil when swapping observed teams.
     eCur,eMax,eInc,eExp = Spring.GetTeamResources(myTeamID,"energy")
+    if eCur == nil then
+        eCur,eMax,eInc,eExp = 0,1,0,0
+    end
     mCur,mMax,mInc,mExp = Spring.GetTeamResources(myTeamID,"metal")
+    if mCur == nil then
+        mCur,mMax,mInc,mExp = 0,1,0,0
+    end
 
     ePct = (eMax>0) and eCur/eMax or 0
     mPct = (mMax>0) and mCur/mMax or 0
