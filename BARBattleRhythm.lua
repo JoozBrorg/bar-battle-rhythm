@@ -1359,6 +1359,13 @@ function widget:Initialize()
         return
     end
 
+    -- Prevent duplicate Settings > Custom entries when toggling the widget off/on.
+    -- WG persists across widget reloads, so we keep a single shared options registration.
+    if WG.__BR_BattleRhythm_OptionsAdded then
+        return
+    end
+    WG.__BR_BattleRhythm_OptionsAdded = true
+
     local function SafeAdd(opt)
         pcall(WG.options.addOption, opt)
     end
